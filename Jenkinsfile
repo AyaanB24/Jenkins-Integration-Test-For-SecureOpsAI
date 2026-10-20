@@ -9,69 +9,124 @@ pipeline {
     environment {
         IMAGE_NAME = 'secureops-demo'
         REPORT_FILE = 'trivy-report.json'
+        SECUREOPS_URL = credentials('secureops-backend-url')
+        PROJECT_ID = 'REPLACE_WITH_EXISTING_PROJECT_ID'
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout & Build') {
             steps {
                 checkout scm
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                sh 'docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .'
-            }
-        }
-
-        stage('Trivy Security Scan') {
-            steps {
                 sh '''
-                    trivy image \
-                      --format json \
-                      --output "$REPORT_FILE" \
-                      --exit-code 0 \
-                      "$IMAGE_NAME:$BUILD_NUMBER"
+                    docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
                 '''
             }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy-report.json',
-                                     allowEmptyArchive: false
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                sh '''
+                    docker run --rm \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      -v "$WORKSPACE:/report" \
+                      aquasecurity/trivy:latest image \
+                      --format json \
+                      --output /report/${REPORT_FILE} \
+                      ${IMAGE_NAME}:${BUILD_NUMBER}
+
+                    test -s "${REPORT_FILE}"
+                '''
+                archiveArtifacts artifacts: 'trivy-report.json',
+                                 fingerprint: true
+            }
+        }
+
+        stage('Submit to SecureOps') {
+            steps {
+                script {
+                    def pipeline = sh(
+                        script: '''
+                            curl -fsS -X POST \
+                              "$SECUREOPS_URL/api/projects/$PROJECT_ID/pipelines" \
+                              -H "Content-Type: application/json" \
+                              -d "{
+                                \\"provider\\":\\"JENKINS\\",
+                                \\"jobName\\":\\"$JOB_NAME\\",
+                                \\"buildNumber\\":$BUILD_NUMBER,
+                                \\"branch\\":\\"$BRANCH_NAME\\",
+                                \\"commitSha\\":\\"$GIT_COMMIT\\"
+                              }"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def p = new groovy.json.JsonSlurperClassic().parseText(pipeline)
+                    if (!p.id) error('SecureOps did not return a pipeline ID')
+
+                    def scan = sh(
+                        script: """
+                            curl -fsS -X POST \\
+                              "$SECUREOPS_URL/api/projects/$PROJECT_ID/scans" \\
+                              -H "Content-Type: application/json" \\
+                              -d '{"pipelineId":"${p.id}","environment":"DEVELOPMENT"}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def s = new groovy.json.JsonSlurperClassic().parseText(scan)
+                    if (!s.id) error('SecureOps did not return a scan ID')
+                    env.SCAN_ID = s.id.toString()
+
+                    def report = sh(
+                        script: '''
+                            curl -fsS -X POST \
+                              "$SECUREOPS_URL/api/scans/$SCAN_ID/reports?tool=TRIVY" \
+                              -F "file=@trivy-report.json"
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def r = new groovy.json.JsonSlurperClassic().parseText(report)
+                    if (!r.id) error('SecureOps did not return a report ID')
+
+                    sh """
+                        curl -fsS -X POST \\
+                          "$SECUREOPS_URL/api/scans/$SCAN_ID/reports/${r.id}/process"
+                    """
                 }
             }
         }
 
-        stage('Upload Report to SecureOps') {
+        stage('Enforce Security Decision') {
             steps {
-                sh '''
-                    test -s "$REPORT_FILE"
+                script {
+                    // Replace this fixed wait with polling of the real processing status.
+                    sleep(time: 3, unit: 'SECONDS')
 
-                    if [ -z "$SECUREOPS_REPORT_URL" ]; then
-                        echo "SecureOps report URL is not configured"
-                        exit 1
-                    fi
+                    def response = sh(
+                        script: '''
+                            curl -fsS \
+                              "$SECUREOPS_URL/api/scans/$SCAN_ID/decision"
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
-                    curl --fail --silent --show-error \
-                      --connect-timeout 10 \
-                      --max-time 60 \
-                      -X POST \
-                      -F "file=@$REPORT_FILE;type=application/json" \
-                      "$SECUREOPS_REPORT_URL"
-                '''
+                    def result =
+                        new groovy.json.JsonSlurperClassic().parseText(response)
+
+                    if (result.decision != 'PASS') {
+                        error("SecureOps decision is not PASS: ${result.decision}")
+                    }
+
+                    echo "SecureOps PASS — Scan ID: ${SCAN_ID}"
+                }
             }
         }
-
-        // Add report-processing and decision-check stages
-        // after confirming the actual SecureOps API contract.
     }
 
     post {
-        success {
-            echo 'Build, Trivy scan and configured report upload completed.'
-        }
-        failure {
-            echo 'Pipeline failed. Check the Jenkins console output.'
+        always {
+            echo "Build result: ${currentBuild.currentResult}"
         }
     }
 }
