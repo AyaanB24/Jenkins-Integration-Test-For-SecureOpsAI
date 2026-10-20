@@ -1,0 +1,5 @@
+.git
+.gitignore
+Jenkinsfile
+trivy-report.json
+README.md
