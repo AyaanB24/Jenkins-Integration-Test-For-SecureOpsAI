@@ -1,6 +1,5 @@
-
+```groovy
 import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
 import java.net.URLEncoder
 
 pipeline {
@@ -76,12 +75,11 @@ pipeline {
         stage('Register Build with SecureOps') {
             steps {
                 script {
-                    def json = new JsonSlurperClassic()
-
-                    // Helper: execute an HTTP request and return status/body.
+                    // HTTP helper: return status and response body.
                     def request = { method, url, payload = null ->
-                        def bodyFile = "secureops-response-${UUID.randomUUID()}.json"
-                        def requestFile = "secureops-request-${UUID.randomUUID()}.json"
+                        def suffix = UUID.randomUUID().toString()
+                        def bodyFile = "secureops-response-${suffix}.json"
+                        def requestFile = "secureops-request-${suffix}.json"
 
                         if (payload != null) {
                             writeFile(
@@ -122,10 +120,11 @@ curl -sS --max-time 30 \
                         ]
                     }
 
-                    // 1. Find the project registered by the user.
+                    // 1. Find the project already registered in SecureOps.
                     def encodedName = URLEncoder.encode(
                         env.PROJECT_NAME, 'UTF-8'
                     )
+
                     def projectResponse = request(
                         'GET',
                         "${env.SECUREOPS_URL}/api/projects?name=${encodedName}"
@@ -133,16 +132,15 @@ curl -sS --max-time 30 \
 
                     if (projectResponse.status != 200) {
                         error(
-                            "SecureOps project lookup failed: HTTP " +
-                            "${projectResponse.status}. Register the project " +
-                            "and verify its name before running Jenkins."
+                            "Project lookup failed: HTTP " +
+                            "${projectResponse.status}: ${projectResponse.body}"
                         )
                     }
 
-                    def project = json.parseText(projectResponse.body)
+                    def project = readJSON text: projectResponse.body
 
                     if (!project.id) {
-                        error('SecureOps project response has no project ID.')
+                        error('SecureOps project response has no ID.')
                     }
 
                     if (project.name != env.PROJECT_NAME) {
@@ -152,13 +150,13 @@ curl -sS --max-time 30 \
                     if (project.repositoryUrl &&
                         project.repositoryUrl.replaceAll('/+$', '') !=
                         env.REPOSITORY_URL.replaceAll('/+$', '')) {
-                        error('Registered project repository URL does not match.')
+                        error('Registered repository URL does not match.')
                     }
 
                     env.SECUREOPS_PROJECT_ID = project.id.toString()
-                    echo "SecureOps project verified: ${project.name}"
+                    echo "Verified SecureOps project: ${project.name}"
 
-                    // 2. Find this Jenkins build's pipeline record.
+                    // 2. Look for a pipeline record for this Jenkins build.
                     def pipelinesResponse = request(
                         'GET',
                         "${env.SECUREOPS_URL}/api/projects/" +
@@ -168,13 +166,12 @@ curl -sS --max-time 30 \
                     if (pipelinesResponse.status != 200) {
                         error(
                             "Pipeline lookup failed: HTTP " +
-                            "${pipelinesResponse.status}"
+                            "${pipelinesResponse.status}: " +
+                            "${pipelinesResponse.body}"
                         )
                     }
 
-                    def pipelines = json.parseText(
-                        pipelinesResponse.body
-                    )
+                    def pipelines = readJSON text: pipelinesResponse.body
 
                     def branch = (
                         env.BRANCH_NAME ?:
@@ -223,8 +220,8 @@ curl -sS --max-time 30 \
                             )
                         }
 
-                        pipelineId = json.parseText(
-                            createPipeline.body
+                        pipelineId = (
+                            readJSON text: createPipeline.body
                         ).id
                     }
 
@@ -253,10 +250,10 @@ curl -sS --max-time 30 \
                         )
                     }
 
-                    def scan = json.parseText(createScan.body)
+                    def scan = readJSON text: createScan.body
 
                     if (!scan.id) {
-                        error('SecureOps scan response has no scan ID.')
+                        error('SecureOps scan response has no ID.')
                     }
 
                     env.SECUREOPS_SCAN_ID = scan.id.toString()
@@ -296,9 +293,7 @@ curl -sS --max-time 120 \
                         )
                     }
 
-                    def uploaded = new JsonSlurperClassic().parseText(
-                        readFile(responseFile)
-                    )
+                    def uploaded = readJSON file: responseFile
                     sh "rm -f '${responseFile}'"
 
                     if (!uploaded.id) {
@@ -318,7 +313,7 @@ curl -sS --max-time 120 \
                         "${env.SECUREOPS_URL}/api/reports/" +
                         "${env.SECUREOPS_REPORT_ID}"
 
-                    // Trigger processing once.
+                    // Trigger report processing.
                     def processFile = 'secureops-process-response.json'
 
                     def processStatus = sh(
@@ -335,6 +330,7 @@ curl -sS --max-time 120 \
 
                     def processBody = fileExists(processFile) ?
                         readFile(processFile) : ''
+
                     if (fileExists(processFile)) {
                         sh "rm -f '${processFile}'"
                     }
@@ -348,7 +344,6 @@ curl -sS --max-time 120 \
 
                     echo "Report processing triggered: ${processBody}"
 
-                    // Wait for the report to finish processing.
                     timeout(time: 5, unit: 'MINUTES') {
                         waitUntil {
                             def responseFile =
@@ -371,9 +366,7 @@ curl -sS --max-time 20 \
                                 )
                             }
 
-                            def report = new JsonSlurperClassic().parseText(
-                                readFile(responseFile)
-                            )
+                            def report = readJSON file: responseFile
                             sh "rm -f '${responseFile}'"
 
                             if (report.status == 'FAILED') {
@@ -408,7 +401,6 @@ curl -sS --max-time 20 \
 
                     def decision = null
 
-                    // Allow the backend time to expose the decision.
                     timeout(time: 2, unit: 'MINUTES') {
                         waitUntil {
                             def responseFile =
@@ -445,7 +437,7 @@ curl -sS --max-time 20 \
                                 )
                             }
 
-                            decision = new JsonSlurperClassic().parseText(body)
+                            decision = readJSON text: body
 
                             if (!(decision.decision in ['PASS', 'BLOCK'])) {
                                 error(
@@ -482,9 +474,6 @@ Reason: ${decision.reason}
                 }
             }
         }
-
-        // Add your real deployment stage AFTER the security gate.
-        // Jenkins cannot reach deployment unless the decision is PASS.
     }
 
     post {
@@ -499,3 +488,4 @@ Reason: ${decision.reason}
         }
     }
 }
+```
