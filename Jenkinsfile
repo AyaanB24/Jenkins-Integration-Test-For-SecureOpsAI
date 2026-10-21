@@ -1,5 +1,5 @@
+```groovy
 import groovy.json.JsonOutput
-import java.net.URLEncoder
 
 pipeline {
     agent any
@@ -7,63 +7,79 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
-        timeout(time: 50, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     environment {
+        // SecureOps backend running on the Windows host
         SECUREOPS_URL = 'http://host.docker.internal:8081'
+
+        // Register this project manually in SecureOps before running Jenkins
         PROJECT_NAME = 'Jenkins-Integration-Test-For-SecureOpsAI'
         REPOSITORY_URL = 'https://github.com/AyaanB24/Jenkins-Integration-Test-For-SecureOpsAI'
-        SECURITY_ENV = 'DEVELOPMENT'
+
+        IMAGE_NAME = 'secureops-demo'
         TRIVY_CACHE = '/var/jenkins_home/trivy-cache'
-        IMAGE_NAME = "secureops-demo:${BUILD_NUMBER}"
+        SCAN_ENVIRONMENT = 'DEVELOPMENT'
     }
 
     stages {
-        stage('Build Docker Image') {
+
+        stage('1. Checkout Source') {
+            steps {
+                checkout scm
+
+                sh '''
+                    set -eu
+                    echo "Repository checked out."
+                    echo "Job: ${JOB_NAME}"
+                    echo "Build: ${BUILD_NUMBER}"
+                    test -f Dockerfile
+                '''
+            }
+        }
+
+        stage('2. Build Docker Image') {
             steps {
                 sh '''
                     set -eu
+
                     docker version
-                    docker build -t "$IMAGE_NAME" .
-                    docker image inspect "$IMAGE_NAME" >/dev/null
+                    docker build \
+                        -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                        .
+
+                    echo "Docker image built successfully."
                 '''
             }
         }
 
-        stage('Export Image') {
+        stage('3. Export Image and Run Trivy') {
             steps {
                 sh '''
                     set -eu
-                    mkdir -p "$TRIVY_CACHE"
-                    docker save "$IMAGE_NAME" \
-                      -o "$WORKSPACE/secureops-demo.tar"
-                    test -s "$WORKSPACE/secureops-demo.tar"
-                '''
-            }
-        }
 
-        stage('Trivy Security Scan') {
-            steps {
-                sh '''
-                    set -eu
+                    mkdir -p "${TRIVY_CACHE}"
+
+                    docker save \
+                        "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                        -o secureops-demo.tar
+
                     docker run --rm \
-                      -v "$WORKSPACE:/scan" \
-                      -v "$TRIVY_CACHE:/root/.cache/" \
-                      aquasec/trivy:latest image \
-                      --timeout 30m \
-                      --input /scan/secureops-demo.tar \
-                      --format json \
-                      --output /scan/trivy-report.json
+                        -v "${WORKSPACE}:/scan" \
+                        -v "${TRIVY_CACHE}:/root/.cache/trivy" \
+                        aquasec/trivy:latest \
+                        image \
+                        --timeout 30m \
+                        --input /scan/secureops-demo.tar \
+                        --format json \
+                        --output /scan/trivy-report.json
 
-                    test -s "$WORKSPACE/trivy-report.json"
+                    test -s trivy-report.json
                     echo "Trivy report generated."
                 '''
-            }
-        }
 
-        stage('Archive Security Report') {
-            steps {
                 archiveArtifacts(
                     artifacts: 'trivy-report.json',
                     fingerprint: true
@@ -71,405 +87,310 @@ pipeline {
             }
         }
 
-        stage('Register Build with SecureOps') {
+        stage('4. Register Build with SecureOps') {
             steps {
                 script {
-                    // HTTP helper: return status and response body.
-                    def request = { method, url, payload = null ->
-                        def suffix = UUID.randomUUID().toString()
-                        def bodyFile = "secureops-response-${suffix}.json"
-                        def requestFile = "secureops-request-${suffix}.json"
+                    // Find the project that the user registered.
+                    def projectJson = sh(
+                        returnStdout: true,
+                        script: """
+                            curl --fail --silent --show-error \
+                              --get \
+                              --data-urlencode 'name=${PROJECT_NAME}' \
+                              '${SECUREOPS_URL}/api/projects'
+                        """
+                    ).trim()
 
-                        if (payload != null) {
-                            writeFile(
-                                file: requestFile,
-                                text: JsonOutput.toJson(payload)
-                            )
-                        }
-
-                        def command = """#!/bin/sh
-set -eu
-curl -sS --max-time 30 \
-  -o '${bodyFile}' \
-  -w '%{http_code}' \
-  -X '${method}' \
-  '${url}' \
-  ${payload != null ?
-      "-H 'Content-Type: application/json' --data-binary '@${requestFile}'" : ""}
-"""
-
-                        def statusText = sh(
-                            script: command,
-                            returnStdout: true
-                        ).trim()
-
-                        def responseBody = fileExists(bodyFile) ?
-                            readFile(bodyFile) : ''
-
-                        if (fileExists(bodyFile)) {
-                            sh "rm -f '${bodyFile}'"
-                        }
-                        if (fileExists(requestFile)) {
-                            sh "rm -f '${requestFile}'"
-                        }
-
-                        return [
-                            status: statusText.toInteger(),
-                            body: responseBody
-                        ]
-                    }
-
-                    // 1. Find the project already registered in SecureOps.
-                    def encodedName = URLEncoder.encode(
-                        env.PROJECT_NAME, 'UTF-8'
+                    def project = readJSON(
+                        text: projectJson,
+                        returnPojo: true
                     )
-
-                    def projectResponse = request(
-                        'GET',
-                        "${env.SECUREOPS_URL}/api/projects?name=${encodedName}"
-                    )
-
-                    if (projectResponse.status != 200) {
-                        error(
-                            "Project lookup failed: HTTP " +
-                            "${projectResponse.status}: ${projectResponse.body}"
-                        )
-                    }
-
-                    def project = readJSON text: projectResponse.body
 
                     if (!project.id) {
-                        error('SecureOps project response has no ID.')
+                        error('SecureOps project was not returned or has no ID.')
                     }
 
                     if (project.name != env.PROJECT_NAME) {
-                        error('SecureOps returned a different project.')
+                        error("Unexpected project returned by SecureOps: ${project.name}")
                     }
 
                     if (project.repositoryUrl &&
-                        project.repositoryUrl.replaceAll('/+$', '') !=
-                        env.REPOSITORY_URL.replaceAll('/+$', '')) {
-                        error('Registered repository URL does not match.')
+                        !project.repositoryUrl.replaceAll('/+$', '')
+                            .replaceAll(/\\.git$/, '')
+                            .equalsIgnoreCase(
+                                env.REPOSITORY_URL.replaceAll('/+$', '')
+                                    .replaceAll(/\\.git$/, '')
+                            )) {
+                        error('The registered project repository URL does not match this Jenkins repository.')
                     }
 
-                    env.SECUREOPS_PROJECT_ID = project.id.toString()
-                    echo "Verified SecureOps project: ${project.name}"
+                    env.PROJECT_ID = project.id.toString()
+                    echo "SecureOps project found: ${project.name}"
+                    echo "Project ID: ${env.PROJECT_ID}"
 
-                    // 2. Look for a pipeline record for this Jenkins build.
-                    def pipelinesResponse = request(
-                        'GET',
-                        "${env.SECUREOPS_URL}/api/projects/" +
-                        "${project.id}/pipelines"
+                    // Check for this exact Jenkins build before creating a pipeline.
+                    def pipelinesJson = sh(
+                        returnStdout: true,
+                        script: """
+                            curl --fail --silent --show-error \
+                              '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
+                        """
+                    ).trim()
+
+                    def pipelines = readJSON(
+                        text: pipelinesJson,
+                        returnPojo: true
                     )
 
-                    if (pipelinesResponse.status != 200) {
-                        error(
-                            "Pipeline lookup failed: HTTP " +
-                            "${pipelinesResponse.status}: " +
-                            "${pipelinesResponse.body}"
-                        )
+                    def existingPipeline = pipelines.find { p ->
+                        p.jobName == env.JOB_NAME &&
+                        p.buildNumber?.toString() == env.BUILD_NUMBER
                     }
-
-                    def pipelines = readJSON text: pipelinesResponse.body
-
-                    def branch = (
-                        env.BRANCH_NAME ?:
-                        env.GIT_BRANCH ?:
-                        'master'
-                    ).replaceFirst('^origin/', '')
-
-                    def commit = env.GIT_COMMIT
-                    if (!commit) {
-                        commit = sh(
-                            script: 'git rev-parse HEAD',
-                            returnStdout: true
-                        ).trim()
-                    }
-
-                    def existingPipeline = pipelines.find {
-                        it.jobName == env.JOB_NAME &&
-                        it.buildNumber?.toString() ==
-                            env.BUILD_NUMBER.toString()
-                    }
-
-                    def pipelineId
 
                     if (existingPipeline) {
-                        pipelineId = existingPipeline.id
-                        echo "Using existing pipeline record: ${pipelineId}"
+                        env.PIPELINE_ID = existingPipeline.id.toString()
+                        echo "Reusing existing pipeline record: ${env.PIPELINE_ID}"
                     } else {
-                        def createPipeline = request(
-                            'POST',
-                            "${env.SECUREOPS_URL}/api/projects/" +
-                            "${project.id}/pipelines",
-                            [
-                                provider: 'JENKINS',
-                                jobName: env.JOB_NAME,
-                                buildNumber: env.BUILD_NUMBER.toInteger(),
-                                branch: branch,
-                                commitSha: commit
-                            ]
+                        def pipelinePayload = [
+                            provider  : 'JENKINS',
+                            jobName   : env.JOB_NAME,
+                            buildNumber: env.BUILD_NUMBER.toInteger(),
+                            branch    : env.BRANCH_NAME ?: 'master',
+                            commitSha : env.GIT_COMMIT ?: ''
+                        ]
+
+                        writeFile(
+                            file: 'pipeline-payload.json',
+                            text: JsonOutput.toJson(pipelinePayload)
                         )
 
-                        if (createPipeline.status != 201) {
-                            error(
-                                "Pipeline creation failed: HTTP " +
-                                "${createPipeline.status}: " +
-                                "${createPipeline.body}"
-                            )
+                        def createPipelineJson = sh(
+                            returnStdout: true,
+                            script: """
+                                curl --fail --silent --show-error \
+                                  -X POST \
+                                  -H 'Content-Type: application/json' \
+                                  --data-binary @pipeline-payload.json \
+                                  '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
+                            """
+                        ).trim()
+
+                        def createdPipeline = readJSON(
+                            text: createPipelineJson,
+                            returnPojo: true
+                        )
+
+                        if (!createdPipeline.id) {
+                            error('SecureOps did not return the created pipeline ID.')
                         }
 
-                        pipelineId = (
-                            readJSON text: createPipeline.body
-                        ).id
+                        env.PIPELINE_ID = createdPipeline.id.toString()
                     }
 
-                    if (!pipelineId) {
-                        error('SecureOps pipeline ID is missing.')
-                    }
+                    // Create one scan for this build.
+                    def scanPayload = [
+                        pipelineId: env.PIPELINE_ID,
+                        environment: env.SCAN_ENVIRONMENT
+                    ]
 
-                    env.SECUREOPS_PIPELINE_ID = pipelineId.toString()
-                    echo "SecureOps pipeline: ${pipelineId}"
-
-                    // 3. Create a fresh scan for this build.
-                    def createScan = request(
-                        'POST',
-                        "${env.SECUREOPS_URL}/api/projects/" +
-                        "${project.id}/scans",
-                        [
-                            pipelineId: pipelineId.toString(),
-                            environment: env.SECURITY_ENV
-                        ]
+                    writeFile(
+                        file: 'scan-payload.json',
+                        text: JsonOutput.toJson(scanPayload)
                     )
 
-                    if (createScan.status != 201) {
-                        error(
-                            "Scan creation failed: HTTP " +
-                            "${createScan.status}: ${createScan.body}"
-                        )
-                    }
-
-                    def scan = readJSON text: createScan.body
-
-                    if (!scan.id) {
-                        error('SecureOps scan response has no ID.')
-                    }
-
-                    env.SECUREOPS_SCAN_ID = scan.id.toString()
-                    echo "Created SecureOps scan: ${scan.id}"
-                }
-            }
-        }
-
-        stage('Upload Trivy Report to SecureOps') {
-            steps {
-                script {
-                    sh '''
-                        set -eu
-                        test -s "$WORKSPACE/trivy-report.json"
-                    '''
-
-                    def responseFile = 'secureops-upload-response.json'
-
-                    def status = sh(
-                        script: """#!/bin/sh
-set -eu
-curl -sS --max-time 120 \
-  -o '${responseFile}' \
-  -w '%{http_code}' \
-  -X POST \
-  "\${SECUREOPS_URL}/api/scans/\${SECUREOPS_SCAN_ID}/reports?tool=TRIVY" \
-  -F "file=@\${WORKSPACE}/trivy-report.json"
-""",
-                        returnStdout: true
+                    def createScanJson = sh(
+                        returnStdout: true,
+                        script: """
+                            curl --fail --silent --show-error \
+                              -X POST \
+                              -H 'Content-Type: application/json' \
+                              --data-binary @scan-payload.json \
+                              '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans'
+                        """
                     ).trim()
 
-                    if (status.toInteger() != 201) {
-                        def body = fileExists(responseFile) ?
-                            readFile(responseFile) : ''
-                        error(
-                            "Report upload failed: HTTP ${status}: ${body}"
-                        )
+                    def createdScan = readJSON(
+                        text: createScanJson,
+                        returnPojo: true
+                    )
+
+                    if (!createdScan.id) {
+                        error('SecureOps did not return the scan ID.')
                     }
 
-                    def uploaded = readJSON file: responseFile
-                    sh "rm -f '${responseFile}'"
+                    env.SCAN_ID = createdScan.id.toString()
 
-                    if (!uploaded.id) {
-                        error('Upload response has no report ID.')
-                    }
-
-                    env.SECUREOPS_REPORT_ID = uploaded.id.toString()
-                    echo "Report uploaded: ${uploaded.id}"
+                    echo "Pipeline ID: ${env.PIPELINE_ID}"
+                    echo "Scan ID: ${env.SCAN_ID}"
                 }
             }
         }
 
-        stage('Process Security Report') {
+        stage('5. Upload Trivy Report') {
             steps {
                 script {
-                    def reportUrl =
-                        "${env.SECUREOPS_URL}/api/reports/" +
-                        "${env.SECUREOPS_REPORT_ID}"
-
-                    // Trigger report processing.
-                    def processFile = 'secureops-process-response.json'
-
-                    def processStatus = sh(
-                        script: """#!/bin/sh
-set -eu
-curl -sS --max-time 120 \
-  -o '${processFile}' \
-  -w '%{http_code}' \
-  -X POST \
-  "\${SECUREOPS_URL}/api/scans/\${SECUREOPS_SCAN_ID}/reports/\${SECUREOPS_REPORT_ID}/process"
-""",
-                        returnStdout: true
+                    def uploadJson = sh(
+                        returnStdout: true,
+                        script: """
+                            curl --fail --silent --show-error \
+                              -X POST \
+                              -F 'file=@trivy-report.json;type=application/json' \
+                              '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports?tool=TRIVY'
+                        """
                     ).trim()
 
-                    def processBody = fileExists(processFile) ?
-                        readFile(processFile) : ''
+                    def uploadedReport = readJSON(
+                        text: uploadJson,
+                        returnPojo: true
+                    )
 
-                    if (fileExists(processFile)) {
-                        sh "rm -f '${processFile}'"
+                    def reportId = uploadedReport.reportId ?: uploadedReport.id
+
+                    if (!reportId) {
+                        error("SecureOps did not return a report ID. Response: ${uploadJson}")
                     }
 
-                    if (processStatus.toInteger() != 200) {
-                        error(
-                            "Report processing failed: HTTP " +
-                            "${processStatus}: ${processBody}"
+                    env.REPORT_ID = reportId.toString()
+
+                    echo "Report uploaded: ${env.REPORT_ID}"
+                    echo "Initial report status: ${uploadedReport.status}"
+                }
+            }
+        }
+
+        stage('6. Process Security Report') {
+            steps {
+                script {
+                    def processJson = sh(
+                        returnStdout: true,
+                        script: """
+                            curl --fail --silent --show-error \
+                              -X POST \
+                              '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports/${REPORT_ID}/process'
+                        """
+                    ).trim()
+
+                    def processResult = readJSON(
+                        text: processJson,
+                        returnPojo: true
+                    )
+
+                    echo "Report processing response: ${processJson}"
+
+                    if (processResult.status == 'FAILED') {
+                        error('SecureOps reported that report processing failed.')
+                    }
+
+                    // Wait for asynchronous report processing to finish.
+                    def processed = false
+
+                    for (int attempt = 1; attempt <= 24; attempt++) {
+                        def reportJson = sh(
+                            returnStdout: true,
+                            script: """
+                                curl --fail --silent --show-error \
+                                  '${SECUREOPS_URL}/api/reports/${REPORT_ID}'
+                            """
+                        ).trim()
+
+                        def reportStatus = readJSON(
+                            text: reportJson,
+                            returnPojo: true
                         )
+
+                        echo "Report status, attempt ${attempt}: ${reportStatus.status}"
+
+                        if (reportStatus.status == 'PROCESSED') {
+                            processed = true
+                            break
+                        }
+
+                        if (reportStatus.status == 'FAILED') {
+                            error("SecureOps failed to process report ${env.REPORT_ID}.")
+                        }
+
+                        sleep time: 5, unit: 'SECONDS'
                     }
 
-                    echo "Report processing triggered: ${processBody}"
+                    if (!processed) {
+                        error('Timed out waiting for SecureOps to process the Trivy report.')
+                    }
 
-                    timeout(time: 5, unit: 'MINUTES') {
-                        waitUntil {
-                            def responseFile =
-                                'secureops-report-status.json'
+                    echo 'Security report successfully processed.'
+                }
+            }
+        }
 
-                            def status = sh(
-                                script: """#!/bin/sh
-set -eu
-curl -sS --max-time 20 \
-  -o '${responseFile}' \
-  -w '%{http_code}' \
-  '${reportUrl}'
-""",
-                                returnStdout: true
+        stage('7. Evaluate Security Policy') {
+            steps {
+                script {
+                    def decisionReceived = false
+                    def decisionData = null
+
+                    // The decision may not exist immediately after processing.
+                    for (int attempt = 1; attempt <= 12; attempt++) {
+                        def httpCode = sh(
+                            returnStdout: true,
+                            script: """
+                                curl --silent --show-error \
+                                  -o decision-response.json \
+                                  -w '%{http_code}' \
+                                  '${SECUREOPS_URL}/api/scans/${SCAN_ID}/decision'
+                            """
+                        ).trim()
+
+                        if (httpCode == '200') {
+                            def responseText = readFile(
+                                file: 'decision-response.json'
                             ).trim()
 
-                            if (status.toInteger() != 200) {
-                                error(
-                                    "Cannot retrieve report status: HTTP ${status}"
-                                )
+                            decisionData = readJSON(
+                                text: responseText,
+                                returnPojo: true
+                            )
+
+                            if (decisionData.decision) {
+                                decisionReceived = true
+                                break
                             }
-
-                            def report = readJSON file: responseFile
-                            sh "rm -f '${responseFile}'"
-
-                            if (report.status == 'FAILED') {
-                                error('SecureOps report processing failed.')
-                            }
-
-                            if (report.status == 'PROCESSED') {
-                                echo 'SecureOps report is PROCESSED.'
-                                return true
-                            }
-
-                            if (!(report.status in ['RECEIVED', 'PROCESSING'])) {
-                                error(
-                                    "Unexpected report status: ${report.status}"
-                                )
-                            }
-
-                            sleep(time: 3, unit: 'SECONDS')
-                            return false
+                        } else {
+                            echo "Decision not ready yet (HTTP ${httpCode}), attempt ${attempt}."
                         }
+
+                        sleep time: 5, unit: 'SECONDS'
+                    }
+
+                    if (!decisionReceived) {
+                        error('No valid SecureOps security decision was received. Failing closed.')
+                    }
+
+                    env.DECISION = decisionData.decision.toString()
+
+                    echo '========== SECUREOPS SECURITY DECISION =========='
+                    echo "Decision: ${decisionData.decision}"
+                    echo "Risk Score: ${decisionData.riskScore}"
+                    echo "Critical: ${decisionData.criticalCount}"
+                    echo "High: ${decisionData.highCount}"
+                    echo "Medium: ${decisionData.mediumCount}"
+                    echo "Low: ${decisionData.lowCount}"
+                    echo "Reason: ${decisionData.reason}"
+                    echo '================================================='
+
+                    if (env.DECISION != 'PASS' && env.DECISION != 'BLOCK') {
+                        error("Unknown security decision '${env.DECISION}'. Failing closed.")
                     }
                 }
             }
         }
 
-        stage('Enforce SecureOps Decision') {
+        stage('8. Enforce Security Gate') {
             steps {
                 script {
-                    def decisionUrl =
-                        "${env.SECUREOPS_URL}/api/scans/" +
-                        "${env.SECUREOPS_SCAN_ID}/decision"
-
-                    def decision = null
-
-                    timeout(time: 2, unit: 'MINUTES') {
-                        waitUntil {
-                            def responseFile =
-                                'secureops-decision-response.json'
-
-                            def status = sh(
-                                script: """#!/bin/sh
-set -eu
-curl -sS --max-time 20 \
-  -o '${responseFile}' \
-  -w '%{http_code}' \
-  '${decisionUrl}'
-""",
-                                returnStdout: true
-                            ).trim()
-
-                            def body = fileExists(responseFile) ?
-                                readFile(responseFile) : ''
-
-                            if (fileExists(responseFile)) {
-                                sh "rm -f '${responseFile}'"
-                            }
-
-                            if (status.toInteger() == 404) {
-                                echo 'Decision not available yet; retrying.'
-                                sleep(time: 3, unit: 'SECONDS')
-                                return false
-                            }
-
-                            if (status.toInteger() != 200) {
-                                error(
-                                    "Decision request failed: HTTP " +
-                                    "${status}: ${body}"
-                                )
-                            }
-
-                            decision = readJSON text: body
-
-                            if (!(decision.decision in ['PASS', 'BLOCK'])) {
-                                error(
-                                    "Invalid SecureOps decision: " +
-                                    "${decision.decision}"
-                                )
-                            }
-
-                            return true
-                        }
+                    if (env.DECISION == 'BLOCK') {
+                        error('SECUREOPS BLOCKED THIS BUILD. Fix the security findings and rerun.')
                     }
 
-                    echo """
-SecureOps Security Decision
-Scan: ${decision.scanId}
-Decision: ${decision.decision}
-Risk Score: ${decision.riskScore}
-Critical: ${decision.criticalCount}
-High: ${decision.highCount}
-Medium: ${decision.mediumCount}
-Low: ${decision.lowCount}
-Reason: ${decision.reason}
-"""
-
-                    env.SECUREOPS_DECISION = decision.decision.toString()
-
-                    if (decision.decision == 'BLOCK') {
-                        error(
-                            "SECUREOPS BLOCKED this build: ${decision.reason}"
-                        )
-                    }
-
-                    echo 'SECUREOPS PASS: security gate passed.'
+                    echo 'SECUREOPS PASSED. Build is approved by the security policy.'
                 }
             }
         }
@@ -477,13 +398,19 @@ Reason: ${decision.reason}
 
     post {
         success {
-            echo 'Build and SecureOps security gate succeeded.'
+            echo "SecureOps pipeline completed successfully. Decision: ${env.DECISION}"
         }
+
         failure {
-            echo 'Build failed or SecureOps rejected/failed the security check.'
+            echo 'SecureOps pipeline failed. Review the stage logs and security decision.'
         }
+
         always {
-            echo 'SecureOps integration pipeline finished.'
+            echo "Build: ${env.BUILD_NUMBER}"
+            echo "Project ID: ${env.PROJECT_ID ?: 'not registered'}"
+            echo "Scan ID: ${env.SCAN_ID ?: 'not created'}"
+            echo "Report ID: ${env.REPORT_ID ?: 'not uploaded'}"
+            echo "Decision: ${env.DECISION ?: 'not received'}"
         }
     }
 }
