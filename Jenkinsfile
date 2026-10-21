@@ -67,6 +67,29 @@ pipeline {
                 )
             }
         }
+        
+        stage('Upload Report to SecureOps AI') {
+            steps {
+                sh '''
+                    set -eu
+
+                    SECUREOPS_URL="http://host.docker.internal:8081"
+                    SCAN_ID="f34026f5-d8f5-4144-be41-32984a2e4b8d"
+
+                    test -s "$WORKSPACE/trivy-report.json"
+
+                    echo "Uploading Trivy report to SecureOps AI..."
+
+                    curl --fail-with-body --silent --show-error \
+                      --max-time 120 \
+                      -X POST \
+                      "$SECUREOPS_URL/api/scans/$SCAN_ID/reports?tool=TRIVY" \
+                      -F "file=@$WORKSPACE/trivy-report.json"
+
+                    echo "Report upload request completed."
+                '''
+            }
+        }
     }
 
     post {
