@@ -1,4 +1,4 @@
-```groovy
+
 import groovy.json.JsonOutput
 
 pipeline {
@@ -414,4 +414,4 @@ pipeline {
         }
     }
 }
-```
+
