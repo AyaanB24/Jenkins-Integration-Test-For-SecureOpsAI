@@ -12,10 +12,12 @@ pipeline {
     }
 
     environment {
-        // SecureOps backend running on the Windows host
+        // Jenkins Credentials: Secret text, ID = secureops-api-key
+        SECUREOPS_API_KEY = credentials('secureops-api-key')
+
+        // SecureOps backend running on Windows host
         SECUREOPS_URL = 'http://host.docker.internal:8081'
 
-        // Register this project manually in SecureOps before running Jenkins
         PROJECT_NAME = 'Jenkins-Integration-Test-For-SecureOpsAI'
         REPOSITORY_URL = 'https://github.com/AyaanB24/Jenkins-Integration-Test-For-SecureOpsAI'
 
@@ -44,12 +46,8 @@ pipeline {
             steps {
                 sh '''
                     set -eu
-
                     docker version
-                    docker build \
-                        -t "${IMAGE_NAME}:${BUILD_NUMBER}" \
-                        .
-
+                    docker build -t "${IMAGE_NAME}:${BUILD_NUMBER}" .
                     echo "Docker image built successfully."
                 '''
             }
@@ -90,11 +88,13 @@ pipeline {
         stage('4. Register Build with SecureOps') {
             steps {
                 script {
-                    // Find the project that the user registered.
+                    // Find the registered project using API-key authentication.
                     def projectJson = sh(
                         returnStdout: true,
                         script: """
+                            set +x
                             curl --fail --silent --show-error \
+                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                               --get \
                               --data-urlencode 'name=${PROJECT_NAME}' \
                               '${SECUREOPS_URL}/api/projects'
@@ -116,23 +116,26 @@ pipeline {
 
                     if (project.repositoryUrl &&
                         !project.repositoryUrl.replaceAll('/+$', '')
-                            .replaceAll(/\\.git$/, '')
+                            .replaceAll(/\.git$/, '')
                             .equalsIgnoreCase(
                                 env.REPOSITORY_URL.replaceAll('/+$', '')
-                                    .replaceAll(/\\.git$/, '')
+                                    .replaceAll(/\.git$/, '')
                             )) {
                         error('The registered project repository URL does not match this Jenkins repository.')
                     }
 
                     env.PROJECT_ID = project.id.toString()
+
                     echo "SecureOps project found: ${project.name}"
                     echo "Project ID: ${env.PROJECT_ID}"
 
-                    // Check for this exact Jenkins build before creating a pipeline.
+                    // Check for an existing record for this exact build.
                     def pipelinesJson = sh(
                         returnStdout: true,
                         script: """
+                            set +x
                             curl --fail --silent --show-error \
+                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                               '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
                         """
                     ).trim()
@@ -152,11 +155,11 @@ pipeline {
                         echo "Reusing existing pipeline record: ${env.PIPELINE_ID}"
                     } else {
                         def pipelinePayload = [
-                            provider  : 'JENKINS',
-                            jobName   : env.JOB_NAME,
-                            buildNumber: env.BUILD_NUMBER.toInteger(),
-                            branch    : env.BRANCH_NAME ?: 'master',
-                            commitSha : env.GIT_COMMIT ?: ''
+                            provider    : 'JENKINS',
+                            jobName     : env.JOB_NAME,
+                            buildNumber : env.BUILD_NUMBER.toInteger(),
+                            branch      : env.BRANCH_NAME ?: 'master',
+                            commitSha   : env.GIT_COMMIT ?: ''
                         ]
 
                         writeFile(
@@ -167,8 +170,10 @@ pipeline {
                         def createPipelineJson = sh(
                             returnStdout: true,
                             script: """
+                                set +x
                                 curl --fail --silent --show-error \
                                   -X POST \
+                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                                   -H 'Content-Type: application/json' \
                                   --data-binary @pipeline-payload.json \
                                   '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
@@ -189,7 +194,7 @@ pipeline {
 
                     // Create one scan for this build.
                     def scanPayload = [
-                        pipelineId: env.PIPELINE_ID,
+                        pipelineId : env.PIPELINE_ID,
                         environment: env.SCAN_ENVIRONMENT
                     ]
 
@@ -201,8 +206,10 @@ pipeline {
                     def createScanJson = sh(
                         returnStdout: true,
                         script: """
+                            set +x
                             curl --fail --silent --show-error \
                               -X POST \
+                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                               -H 'Content-Type: application/json' \
                               --data-binary @scan-payload.json \
                               '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans'
@@ -232,8 +239,10 @@ pipeline {
                     def uploadJson = sh(
                         returnStdout: true,
                         script: """
+                            set +x
                             curl --fail --silent --show-error \
                               -X POST \
+                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                               -F 'file=@trivy-report.json;type=application/json' \
                               '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports?tool=TRIVY'
                         """
@@ -264,8 +273,10 @@ pipeline {
                     def processJson = sh(
                         returnStdout: true,
                         script: """
+                            set +x
                             curl --fail --silent --show-error \
                               -X POST \
+                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                               '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports/${REPORT_ID}/process'
                         """
                     ).trim()
@@ -281,14 +292,16 @@ pipeline {
                         error('SecureOps reported that report processing failed.')
                     }
 
-                    // Wait for asynchronous report processing to finish.
+                    // Wait for asynchronous report processing.
                     def processed = false
 
                     for (int attempt = 1; attempt <= 24; attempt++) {
                         def reportJson = sh(
                             returnStdout: true,
                             script: """
+                                set +x
                                 curl --fail --silent --show-error \
+                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                                   '${SECUREOPS_URL}/api/reports/${REPORT_ID}'
                             """
                         ).trim()
@@ -327,12 +340,13 @@ pipeline {
                     def decisionReceived = false
                     def decisionData = null
 
-                    // The decision may not exist immediately after processing.
                     for (int attempt = 1; attempt <= 12; attempt++) {
                         def httpCode = sh(
                             returnStdout: true,
                             script: """
+                                set +x
                                 curl --silent --show-error \
+                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
                                   -o decision-response.json \
                                   -w '%{http_code}' \
                                   '${SECUREOPS_URL}/api/scans/${SCAN_ID}/decision'
@@ -414,4 +428,3 @@ pipeline {
         }
     }
 }
-
