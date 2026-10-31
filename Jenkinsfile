@@ -85,6 +85,22 @@ pipeline {
             }
         }
 
+        stage('SecureOps Authentication Diagnostic') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'secureops-api-key', variable: 'API_KEY')
+                ]) {
+                    sh '''
+                        set +x
+                        curl -sS -o /dev/null \
+                          -w "Projects API HTTP: %{http_code}\\n" \
+                          -H "X-API-Key: $API_KEY" \
+                          "http://host.docker.internal:8081/api/projects?name=Jenkins-Integration-Test-For-SecureOpsAI"
+                    '''
+                }
+            }
+        }
+
         stage('4. Register Build with SecureOps') {
             steps {
                 script {
