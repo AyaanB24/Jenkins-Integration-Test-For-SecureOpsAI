@@ -110,7 +110,7 @@ pipeline {
                         script: """
                             set +x
                             curl --fail --silent --show-error \
-                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
+                              -H 'X-API-Key: $SECUREOPS_API_KEY' \
                               --get \
                               --data-urlencode 'name=${PROJECT_NAME}' \
                               '${SECUREOPS_URL}/api/projects'
