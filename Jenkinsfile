@@ -85,22 +85,6 @@ pipeline {
             }
         }
 
-        stage('SecureOps Authentication Diagnostic') {
-            steps {
-                withCredentials([
-                    string(credentialsId: 'secureops-api-key', variable: 'API_KEY')
-                ]) {
-                    sh '''
-                        set +x
-                        curl -sS -o /dev/null \
-                          -w "Projects API HTTP: %{http_code}\\n" \
-                          -H "X-API-Key: $API_KEY" \
-                          "http://host.docker.internal:8081/api/projects?name=Jenkins-Integration-Test-For-SecureOpsAI"
-                    '''
-                }
-            }
-        }
-
         stage('4. Register Build with SecureOps') {
             steps {
                 script {
@@ -110,10 +94,10 @@ pipeline {
                         script: """
                             set +x
                             curl --fail --silent --show-error \
-                              -H 'X-API-Key: $SECUREOPS_API_KEY' \
+                              -H "X-API-Key: \$SECUREOPS_API_KEY" \
                               --get \
-                              --data-urlencode 'name=${PROJECT_NAME}' \
-                              '${SECUREOPS_URL}/api/projects'
+                              --data-urlencode 'name=${env.PROJECT_NAME}' \
+                              '${env.SECUREOPS_URL}/api/projects'
                         """
                     ).trim()
 
@@ -151,8 +135,8 @@ pipeline {
                         script: """
                             set +x
                             curl --fail --silent --show-error \
-                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
-                              '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
+                              -H "X-API-Key: \$SECUREOPS_API_KEY" \
+                              '${env.SECUREOPS_URL}/api/projects/${env.PROJECT_ID}/pipelines'
                         """
                     ).trim()
 
@@ -189,10 +173,10 @@ pipeline {
                                 set +x
                                 curl --fail --silent --show-error \
                                   -X POST \
-                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
+                                  -H "X-API-Key: \$SECUREOPS_API_KEY" \
                                   -H 'Content-Type: application/json' \
                                   --data-binary @pipeline-payload.json \
-                                  '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/pipelines'
+                                  '${env.SECUREOPS_URL}/api/projects/${env.PROJECT_ID}/pipelines'
                             """
                         ).trim()
 
@@ -225,10 +209,10 @@ pipeline {
                             set +x
                             curl --fail --silent --show-error \
                               -X POST \
-                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
+                              -H "X-API-Key: \$SECUREOPS_API_KEY" \
                               -H 'Content-Type: application/json' \
                               --data-binary @scan-payload.json \
-                              '${SECUREOPS_URL}/api/projects/${PROJECT_ID}/scans'
+                              '${env.SECUREOPS_URL}/api/projects/${env.PROJECT_ID}/scans'
                         """
                     ).trim()
 
@@ -258,9 +242,9 @@ pipeline {
                             set +x
                             curl --fail --silent --show-error \
                               -X POST \
-                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
+                              -H "X-API-Key: \$SECUREOPS_API_KEY" \
                               -F 'file=@trivy-report.json;type=application/json' \
-                              '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports?tool=TRIVY'
+                              '${env.SECUREOPS_URL}/api/scans/${env.SCAN_ID}/reports?tool=TRIVY'
                         """
                     ).trim()
 
@@ -292,8 +276,8 @@ pipeline {
                             set +x
                             curl --fail --silent --show-error \
                               -X POST \
-                              -H 'X-API-Key: \$SECUREOPS_API_KEY' \
-                              '${SECUREOPS_URL}/api/scans/${SCAN_ID}/reports/${REPORT_ID}/process'
+                              -H "X-API-Key: \$SECUREOPS_API_KEY" \
+                              '${env.SECUREOPS_URL}/api/scans/${env.SCAN_ID}/reports/${env.REPORT_ID}/process'
                         """
                     ).trim()
 
@@ -317,8 +301,8 @@ pipeline {
                             script: """
                                 set +x
                                 curl --fail --silent --show-error \
-                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
-                                  '${SECUREOPS_URL}/api/reports/${REPORT_ID}'
+                                  -H "X-API-Key: \$SECUREOPS_API_KEY" \
+                                  '${env.SECUREOPS_URL}/api/reports/${env.REPORT_ID}'
                             """
                         ).trim()
 
@@ -362,10 +346,10 @@ pipeline {
                             script: """
                                 set +x
                                 curl --silent --show-error \
-                                  -H 'X-API-Key: \$SECUREOPS_API_KEY' \
+                                  -H "X-API-Key: \$SECUREOPS_API_KEY" \
                                   -o decision-response.json \
                                   -w '%{http_code}' \
-                                  '${SECUREOPS_URL}/api/scans/${SCAN_ID}/decision'
+                                  '${env.SECUREOPS_URL}/api/scans/${env.SCAN_ID}/decision'
                             """
                         ).trim()
 
