@@ -83,6 +83,38 @@ pipeline {
                 )
             }
         }
+        stage('Diagnose SecureOps Authentication') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'secureops-api-key',
+                        variable: 'SECUREOPS_API_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+        
+                        PROJECT_ID="8c16962f-4d95-4678-83aa-efb1aefa1bbb"
+        
+                        echo "Testing project pipelines endpoint..."
+        
+                        HTTP_CODE=$(curl -sS \
+                            -o /tmp/secureops-response.json \
+                            -w "%{http_code}" \
+                            -H "X-API-Key: $SECUREOPS_API_KEY" \
+                            "http://host.docker.internal:8081/api/projects/$PROJECT_ID/pipelines")
+        
+                        echo "HTTP Status: $HTTP_CODE"
+                        cat /tmp/secureops-response.json
+                        echo
+        
+                        if [ "$HTTP_CODE" != "200" ]; then
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
 
         stage('4. Register Build with SecureOps') {
             steps {
